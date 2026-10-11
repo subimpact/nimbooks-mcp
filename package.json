@@ -1,0 +1,55 @@
+{
+  "name": "nimbooks-mcp",
+  "version": "1.0.3",
+  "description": "Read-only MCP server for your Nimiq books — balances, history, statements, and draft payment requests. Never signs.",
+  "license": "MIT",
+  "author": "Jeremy Lee",
+  "homepage": "https://nimbooks.subimpact.net/mcp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/subimpact/nimbooks-mcp.git"
+  },
+  "keywords": [
+    "nimiq",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "accounting",
+    "books",
+    "invoices"
+  ],
+  "type": "module",
+  "bin": {
+    "nimbooks-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "build.mjs",
+    "tsconfig.json",
+    "README.md",
+    "DEMO.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "prepublishOnly": "node build.mjs",
+    "build": "node build.mjs",
+    "test": "node build.mjs && node build.mjs --tests && NIMBOOKS_MCP_NO_REWARDS=1 node --test dist-test/*.test.js",
+    "smoke": "node build.mjs && node build.mjs --tests && NIMBOOKS_SMOKE=1 node dist-test/smoke.js",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "esbuild": "^0.28.2",
+    "typescript": "~6.0.2"
+  },
+  "bugs": {
+    "url": "https://github.com/subimpact/nimbooks-mcp/issues"
+  }
+}
