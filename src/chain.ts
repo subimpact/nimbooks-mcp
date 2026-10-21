@@ -1,9 +1,12 @@
 // Nimiq chain reads — the Node-safe subset of the app's `src/lib/chain.ts`.
 //
 // Same endpoint, same RPC methods, same classification rules, same memo
-// decoding. What is deliberately absent: the browser caches (localStorage),
-// the EVM side, the fiat/validator registries, and anything that builds or
-// signs a transaction. This module reads. It has no way to spend.
+// decoding, plus the validator list the app's stake panel reads. What is
+// deliberately absent: the browser caches (localStorage), the EVM side, the
+// fiat registry, and anything that builds or signs a transaction. This module
+// reads. It has no way to spend.
+
+import { parseValidators, networkStakeLunaFrom, type ValidatorInfo } from './staking.ts'
 
 const RPC_URL = 'https://rpc.nimiqwatch.com'
 
@@ -184,26 +187,54 @@ export interface StakingHolding {
   inactive: string // Luna
   retired: string // Luna
   delegation: string // validator address, '' when unknown
+  // Block height at which the deactivation takes effect; the retire tx is
+  // only valid one full reporting epoch later (inactiveFrom + 43200). 0 when unknown.
+  inactiveFrom: number
 }
 
 /**
- * The address's staker record, or null when it has never staked — the RPC
- * answers that with an error rather than an empty result, which is the common
- * case and not a fault (same handling as the app's `getStakingHolding`).
+ * The address's staker record, or null when it has never staked: the RPC
+ * answers "No staker with address: ..." as an error, so the message is matched
+ * rather than swallowed, so the common case is not a fault, and any other
+ * failure is a lookup that failed and must be reported, not read as "never
+ * staked" (same distinction as the app's fetchStakingHolding).
  */
 export async function getStaking(address: string): Promise<StakingHolding | null> {
+  let data: any
   try {
-    const data = await rpcCall('getStakerByAddress', [cleanAddress(address)])
-    if (typeof data?.balance !== 'number') return null
-    return {
-      active: String(data.balance),
-      inactive: String(data.inactiveBalance ?? 0),
-      retired: String(data.retiredBalance ?? 0),
-      delegation: data.delegation ?? '',
+    data = await rpcCall('getStakerByAddress', [cleanAddress(address)])
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/no staker with address/i.test(msg)) return null
+    if (e instanceof RpcAnswerError) {
+      throw new ToolError(
+        `The Nimiq RPC answered the staker lookup for this address with an error: "${msg}". ` +
+          `The staked status is unknown, not zero.`
+      )
     }
-  } catch {
-    return null
+    throw new ToolError(
+      `Could not look up the staker record for this address: the Nimiq RPC did not answer (${msg}). ` +
+        `Try again in a moment.`
+    )
   }
+  if (typeof data?.balance !== 'number') return null
+  return {
+    active: String(data.balance),
+    inactive: String(data.inactiveBalance ?? 0),
+    retired: String(data.retiredBalance ?? 0),
+    delegation: data.delegation ?? '',
+    inactiveFrom: Number(data.inactiveFrom ?? 0) || 0,
+  }
+}
+
+/** The current block height (RPC getBlockNumber), for unstake clocks. */
+export async function getBlockHeight(): Promise<number> {
+  const data = await rpcCall('getBlockNumber', [])
+  const n = Number(data)
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new ToolError(`The Nimiq RPC returned an unreadable block height (${String(data)}).`)
+  }
+  return n
 }
 
 export async function getTransactions(
@@ -298,6 +329,22 @@ function utcDay(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10)
 }
 
+const DAY_MS = 86_400_000
+
+/** The 00:00 UTC instant that starts the day holding `ms`. */
+function dayStart(ms: number): number {
+  return Math.floor(ms / DAY_MS) * DAY_MS
+}
+
+/**
+ * The 00:00 UTC instant AFTER the day holding `ms`. As a wire `to`, which
+ * the endpoint reads exclusively, it runs a request through that whole day -
+ * including when `ms` sits exactly at that day's own 00:00.
+ */
+function dayAfter(ms: number): number {
+  return dayStart(ms) + DAY_MS
+}
+
 /**
  * Aggregated restaking reward events for a staker between two instants —
  * ported from the app's `getRestakeEvents` (src/lib/stakingEvents.ts), same
@@ -309,9 +356,27 @@ export async function getRestakeEvents(
   fromMs: number,
   toMs: number
 ): Promise<RestakeGroup[]> {
+  return (await getRestakeEventsReport(address, fromMs, toMs)).groups
+}
+
+/**
+ * `getRestakeEvents` that says whether it worked, so callers can report a
+ * short total instead of a silently missing one. Same `[]`-ish shapes: the
+ * groups list is empty on every failure path, `failed` says so.
+ */
+export async function getRestakeEventsReport(
+  address: string,
+  fromMs: number,
+  toMs: number
+): Promise<{ groups: RestakeGroup[]; failed: boolean }> {
+  // Wire contract: `from` inclusive at 00:00 UTC, `to` EXCLUSIVE at 00:00
+  // UTC, never in the future. The arguments are instants: `fromMs` floors to
+  // its day; `toMs` is the last instant included in the ask, so the request
+  // runs through the END of its day (ceil to the next 00:00), capped at
+  // today's 00:00 because the API rejects a future `to`.
   const from = utcDay(fromMs)
-  const to = utcDay(Math.min(toMs, Date.now()))
-  if (from >= to) return []
+  const to = utcDay(Math.min(dayAfter(toMs), dayStart(Date.now())))
+  if (from >= to) return { groups: [], failed: false }
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 20000)
@@ -324,27 +389,107 @@ export async function getRestakeEvents(
     if (!res.ok) throw new Error(`Restake events HTTP ${res.status}`)
     const json: unknown = await res.json()
     const groups = (json as { groups?: unknown } | null)?.groups
-    if (!Array.isArray(groups)) return []
-    return groups.filter(
-      (g: unknown): g is RestakeGroup =>
-        !!g &&
-        typeof (g as RestakeGroup).time_window === 'string' &&
-        Number.isFinite(Number((g as RestakeGroup).aggregated_value))
-    )
+    if (!Array.isArray(groups)) return { groups: [], failed: false }
+    return {
+      groups: groups.filter(
+        (g: unknown): g is RestakeGroup =>
+          !!g &&
+          typeof (g as RestakeGroup).time_window === 'string' &&
+          Number.isFinite(Number((g as RestakeGroup).aggregated_value))
+      ),
+      failed: false,
+    }
   } catch (e) {
     console.warn('getRestakeEvents failed:', e)
-    return []
+    return { groups: [], failed: true }
   } finally {
     clearTimeout(timer)
   }
 }
 
-/** History range for reward rows: the last 90 days, matching the app. */
-export const RESTAKE_WINDOW_DAYS = 90
-const DAY_MS = 24 * 60 * 60 * 1000
+/** The UTC day proof-of-stake mainnet launched - the earliest day worth asking for. */
+export const REWARDS_FLOOR_DAY = '2024-11-19'
 
-export function restakeWindow(now = Date.now()): { fromMs: number; toMs: number } {
-  return { fromMs: now - RESTAKE_WINDOW_DAYS * DAY_MS, toMs: now }
+/**
+ * Restaking rewards for an address as rows, covering `[fromMs, toMs]` with
+ * both ends INCLUSIVE instants.
+ *
+ * The range is clamped to the public data (floor day, now) and split into
+ * calendar-year requests - one request per calendar year, at most. The
+ * endpoint's `to` is exclusive at 00:00 UTC, so each request's wire `to` is
+ * the UTC day AFTER the day holding its last included instant - ceil to the
+ * next 00:00 - capped at today's 00:00 because the API rejects a future
+ * `to`. A `toMs` exactly at 00:00 of a day still counts as including that
+ * instant, and a window can sit exactly there, so the choice made here is to
+ * run the request through the END of that day (`to` = the day after, the
+ * trim below stays day-granular) and let the exact-timestamp filters
+ * downstream - `inWindow` (index.ts) and `computeStatement` (statement.ts) -
+ * drop the rows past the instant. Each response keeps only groups inside its
+ * own requested range (from-day 00:00 <= time_window < request to-day
+ * 00:00): the API leaks the last window before `from` and the first at/after
+ * `to` at its edges, and abutting ranges must never count a window twice. No
+ * cache here (this ships as a CLI: the asker holds the window), and the
+ * failure tolerance is the old one - a failing request contributes `[]`
+ * while the rest still count. Never throws.
+ */
+/** One calendar-year request's outcome: its rows plus whether the request failed. */
+export interface RewardTxsReport {
+  rows: NimiqTx[]
+  failedYears: number[]
+}
+
+/**
+ * A reporting variant of `getRestakeRewardTxs`: the same rows, plus the
+ * calendar years whose request to Nimiq Watch did not answer, so callers can
+ * say "the total may be short" instead of silently dropping a year's
+ * rewards. The rows are identical to the wrapper's.
+ */
+export async function getRestakeRewardTxsReport(
+  address: string,
+  fromMs: number,
+  toMs: number
+): Promise<RewardTxsReport> {
+  const from = Math.max(fromMs, Date.parse(REWARDS_FLOOR_DAY + 'T00:00:00Z'))
+  const to = Math.min(toMs, Date.now())
+  if (to < from) return { rows: [], failedYears: [] }
+  const rows: NimiqTx[] = []
+  const failedYears: number[] = []
+  const firstYear = Number(utcDay(from).slice(0, 4))
+  const lastYear = Number(utcDay(to).slice(0, 4))
+  const today00 = dayStart(Date.now())
+  for (let y = firstYear; y <= lastYear; y++) {
+    const reqFrom = Math.max(from, Date.UTC(y, 0, 1))
+    // Slices are inclusive instants, so a seam slice ends 1ms before next
+    // New Year's midnight: the midnight instant itself belongs to the next
+    // year's slice, which keeps it exactly there.
+    const reqEnd = Math.min(to, Date.UTC(y + 1, 0, 1) - 1)
+    if (reqEnd < reqFrom) continue
+    const { groups, failed } = await getRestakeEventsReport(address, reqFrom, reqEnd)
+    if (failed) failedYears.push(y)
+    // getRestakeEventsReport already answers an empty list on failure. Trim
+    // the edge leaks to this request's own wire range, in case the caller's
+    // ranges abut.
+    const lo = dayStart(reqFrom)
+    const hi = Math.min(dayAfter(reqEnd), today00)
+    rows.push(
+      ...rollUpRestakeRewards(
+        groups.filter((g) => {
+          const t = Date.parse(g.time_window)
+          return Number.isFinite(t) && t >= lo && t < hi
+        }),
+        address
+      )
+    )
+  }
+  return { rows: rows.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0)), failedYears }
+}
+
+export async function getRestakeRewardTxs(
+  address: string,
+  fromMs: number,
+  toMs: number
+): Promise<NimiqTx[]> {
+  return (await getRestakeRewardTxsReport(address, fromMs, toMs)).rows
 }
 
 /**
@@ -385,15 +530,6 @@ export function rollUpRestakeRewards(groups: RestakeGroup[], ownAddress: string)
       toType: 0,
       synthetic: 'reward' as const,
     }))
-}
-
-/** Restaking rewards for an address in the app's History shape. Never throws. */
-export async function getRestakeRewardTxs(
-  address: string,
-  fromMs: number,
-  toMs: number
-): Promise<NimiqTx[]> {
-  return rollUpRestakeRewards(await getRestakeEvents(address, fromMs, toMs), address)
 }
 
 export type TxKind = 'payment' | 'stake' | 'unstake' | 'reward' | 'fee' | 'unknown'
@@ -500,4 +636,83 @@ export function memoForRow(tx: NimiqTx, label: TxLabel): string {
 
 export function explorerTxUrl(hash: string): string {
   return `https://nimiq.watch/#${hash}`
+}
+
+// --- Validators list (the same registry the app's stake panel reads) ---
+
+// The app's VALIDATORS_URL, verbatim. One fetch, 20 s timeout, and only an
+// in-process 10-minute memo (pool scores move by the epoch); this server has
+// no localStorage, so there is no cache beyond that memo.
+export const VALIDATORS_URL = 'https://validators-api-main.je-cf9.workers.dev/api/v1/validators/'
+
+const VALIDATORS_FETCH_TIMEOUT_MS = 20000
+const VALIDATORS_MEMO_TTL_MS = 10 * 60 * 1000
+
+export interface ValidatorsSnapshot {
+  validators: ValidatorInfo[] // neutral order (sortValidators)
+  networkStakeLuna: number // the mean back-out of balance / dominanceRatio
+  fetchedAt: number
+}
+
+let validatorsMemo: (ValidatorsSnapshot & { memoAt: number }) | null = null
+
+function validatorsUnavailable(detail: string): ToolError {
+  return new ToolError(
+    `The validators list at ${VALIDATORS_URL} could not be reached (${detail}), so the ` +
+      `validator names, fees and yields are unavailable. Balances and rewards are unaffected: ` +
+      `the staking answers still work, and a yield projection can go ahead when a rate is ` +
+      `given explicitly (annualRatePercent). Try again in a moment.`
+  )
+}
+
+/**
+ * The validator list, one fetch per 10 minutes at most. Throws a ToolError on
+ * any failure: unlike the rewards fetches, a missing validator list is not a
+ * silently-empty answer, because the tools that need it can say exactly what
+ * went away. Gated for offline tests with NIMBOOKS_MCP_NO_VALIDATORS=1, which
+ * makes every call fail the same way an unreachable API does.
+ */
+export async function getValidatorsSnapshot(opts?: { force?: boolean }): Promise<ValidatorsSnapshot> {
+  if (process.env.NIMBOOKS_MCP_NO_VALIDATORS === '1') {
+    throw validatorsUnavailable('the offline gate NIMBOOKS_MCP_NO_VALIDATORS=1 is set')
+  }
+  if (
+    !opts?.force &&
+    validatorsMemo &&
+    Date.now() - validatorsMemo.memoAt < VALIDATORS_MEMO_TTL_MS
+  ) {
+    const { memoAt: _memoAt, ...rest } = validatorsMemo
+    return rest
+  }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), VALIDATORS_FETCH_TIMEOUT_MS)
+  try {
+    const res = await fetch(VALIDATORS_URL, { signal: controller.signal })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const json: unknown = await res.json()
+    const validators = parseValidators(json)
+    validatorsMemo = {
+      validators,
+      networkStakeLuna: networkStakeLunaFrom(json),
+      fetchedAt: Date.now(),
+      memoAt: Date.now(),
+    }
+    const { memoAt: _memoAt, ...rest } = validatorsMemo
+    return rest
+  } catch (e) {
+    // A stale memo still beats nothing, same as the app serves its cache when
+    // a refresh fails and the list is not being forced.
+    if (validatorsMemo && !opts?.force) {
+      const { memoAt: _memoAt, ...rest } = validatorsMemo
+      return rest
+    }
+    const msg = e instanceof Error ? e.message : String(e)
+    throw validatorsUnavailable(msg === 'The operation was aborted' ? 'timed out after 20 s' : msg)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export async function getValidators(opts?: { force?: boolean }): Promise<ValidatorInfo[]> {
+  return (await getValidatorsSnapshot(opts)).validators
 }
